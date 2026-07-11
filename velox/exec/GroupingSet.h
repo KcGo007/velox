@@ -373,6 +373,12 @@ class GroupingSet {
   // Boolean indicating whether any aggregate supports compact().
   bool hasCompactableAggregates_{false};
 
+  // True if any aggregate accumulator allocates memory outside RowContainer's
+  // HashStringAllocator (e.g. directly from MemoryPool). In that case,
+  // RowContainer::estimateRowSize() can under-estimate the actual per-group
+  // memory footprint.
+  bool hasExternalMemoryAccumulators_{false};
+
   uint64_t numInputRows_ = 0;
 
   // Column for groupId for a GROUPING SET.
