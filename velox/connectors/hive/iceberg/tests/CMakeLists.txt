@@ -97,6 +97,7 @@ if(NOT VELOX_DISABLE_GOOGLETEST)
   if(VELOX_ENABLE_GEO AND VELOX_ENABLE_PARQUET)
     add_executable(
       velox_hive_iceberg_geometry_test
+      IcebergGeometryCrossRuntimeEncodingTest.cpp
       IcebergGeometryReadTest.cpp
       IcebergTestBase.cpp
       Main.cpp
@@ -117,6 +118,7 @@ if(NOT VELOX_DISABLE_GOOGLETEST)
       velox_dwio_parquet_writer
       GEOS::geos
       GTest::gtest
+      OpenSSL::Crypto
     )
   endif()
 
