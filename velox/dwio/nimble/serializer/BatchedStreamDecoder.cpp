@@ -115,8 +115,8 @@ BatchedStreamDecoder::BatchedStreamDecoder(
 uint32_t BatchedStreamDecoder::next(
     uint32_t count,
     void* output,
-    std::vector<velox::BufferPtr>& stringBuffers,
     std::function<void*()> getOutputNulls,
+    std::vector<velox::BufferPtr>& stringBuffers,
     const velox::bits::Bitmap* scatterOutputBitmap) {
   NIMBLE_CHECK(
       scatterOutputBitmap == nullptr || !isInMapStream(),
@@ -138,6 +138,26 @@ uint32_t BatchedStreamDecoder::next(
   }
   currentRow_ += count;
   return nonNullCount;
+}
+
+uint32_t BatchedStreamDecoder::read(
+    std::span<const uint32_t> /*rows*/,
+    DataType /*dataType*/,
+    void* /*output*/,
+    std::function<void*()> /*getOutputNulls*/,
+    std::vector<velox::BufferPtr>& /*stringBuffers*/) {
+  NIMBLE_UNSUPPORTED(
+      "BatchedStreamDecoder does not support selective row decoding");
+}
+
+uint32_t BatchedStreamDecoder::read(
+    std::span<const RowRange> /*ranges*/,
+    DataType /*dataType*/,
+    void* /*output*/,
+    std::function<void*()> /*getOutputNulls*/,
+    std::vector<velox::BufferPtr>& /*stringBuffers*/) {
+  NIMBLE_UNSUPPORTED(
+      "BatchedStreamDecoder does not support range row decoding");
 }
 
 void BatchedStreamDecoder::skip(uint32_t count) {

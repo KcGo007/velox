@@ -1951,6 +1951,93 @@ TEST_F(CudfFilterProjectTest, stringUpperOperation) {
   testStringUpperOperation(vectors);
 }
 
+TEST_F(CudfFilterProjectTest, replaceConstantSearchAndReplacement) {
+  // Column string with constant search and replacement, including the
+  // replace(s, '-', '') shape: matches present, absent, repeated, an empty
+  // string row, and a null string row.
+  auto data = makeRowVector(
+      {"s"},
+      {makeNullableFlatVector<std::string>(
+          {"2021-01-31",
+           "no dashes here",
+           "a-b-c-d",
+           "-leading-and-trailing-",
+           "",
+           std::nullopt})});
+  std::vector<RowVectorPtr> vectors{data};
+
+  const std::vector<std::string> projections{
+      "replace(s, '-', '') AS removed",
+      "replace(s, '-', '/') AS slashed",
+      "replace(s, 'zzz', 'x') AS absent"};
+
+  assertProjectMatchesVelox(vectors, projections);
+}
+
+TEST_F(CudfFilterProjectTest, replaceTwoArgumentRemovesSearch) {
+  // The 2-argument form removes every occurrence of the search.
+  auto data = makeRowVector(
+      {"s"},
+      {makeNullableFlatVector<std::string>(
+          {"a-b-c", "abc", "---", std::nullopt})});
+  std::vector<RowVectorPtr> vectors{data};
+
+  const std::vector<std::string> projections{"replace(s, '-') AS result"};
+
+  assertProjectMatchesVelox(vectors, projections);
+}
+
+TEST_F(CudfFilterProjectTest, replaceNullSearchOrReplacement) {
+  // A null constant search or replacement yields an all-null result.
+  auto data = makeRowVector(
+      {"s"},
+      {makeNullableFlatVector<std::string>({"a-b-c", "abc", std::nullopt})});
+  std::vector<RowVectorPtr> vectors{data};
+
+  const std::vector<std::string> projections{
+      "replace(s, CAST(NULL AS VARCHAR), 'x') AS null_search",
+      "replace(s, '-', CAST(NULL AS VARCHAR)) AS null_replacement",
+      "replace(s, CAST(NULL AS VARCHAR)) AS null_search_two_arg"};
+
+  assertProjectMatchesVelox(vectors, projections);
+}
+
+TEST_F(CudfFilterProjectTest, replaceMultiByteUtf8) {
+  // Multi-byte (UTF-8) search and replacement, including a replacement that
+  // changes the byte length and a null string row.
+  auto data = makeRowVector(
+      {"s"},
+      {makeNullableFlatVector<std::string>(
+          {"café-au-lait",
+           "a€b€c",
+           "naïve",
+           "no multibyte here",
+           std::nullopt})});
+  std::vector<RowVectorPtr> vectors{data};
+
+  const std::vector<std::string> projections{
+      "replace(s, 'é', 'e') AS deaccent",
+      "replace(s, '€', 'EUR') AS money",
+      "replace(s, 'ï', 'i') AS naive"};
+
+  assertProjectMatchesVelox(vectors, projections);
+}
+
+TEST_F(CudfFilterProjectTest, replaceReplacementContainsSearch) {
+  // The replacement contains the search: a single left-to-right pass must not
+  // re-scan the inserted text.
+  auto data = makeRowVector(
+      {"s"},
+      {makeNullableFlatVector<std::string>(
+          {"aaa", "banana", "a", std::nullopt})});
+  std::vector<RowVectorPtr> vectors{data};
+
+  const std::vector<std::string> projections{
+      "replace(s, 'a', 'aa') AS doubled", "replace(s, 'ana', 'anana') AS grow"};
+
+  assertProjectMatchesVelox(vectors, projections);
+}
+
 TEST_F(CudfFilterProjectTest, mixedLiteralProjection) {
   vector_size_t batchSize = 1000;
   auto vectors = makeVectors(rowType_, 2, batchSize);
@@ -2272,6 +2359,118 @@ TEST_F(CudfFilterProjectTest, switchExpr) {
           {45676567.78 / 123.4, 6789098767.90876 / 124.5, std::nullopt}),
   });
   facebook::velox::test::assertEqualVectors(expected, result);
+}
+
+TEST_F(CudfFilterProjectTest, switchWithoutElse) {
+  // The fixture disables CPU fallback, so these projections must run on GPU.
+  auto data = makeRowVector(
+      {"flag", "value", "string_value", "decimal_value"},
+      {makeNullableFlatVector<bool>({true, false, std::nullopt, true}),
+       makeNullableFlatVector<int64_t>({10, 20, 30, std::nullopt}),
+       makeNullableFlatVector<std::string>(
+           {"one", "two", "three", std::nullopt}),
+       makeNullableFlatVector<int64_t>(
+           {123, 456, 789, std::nullopt}, DECIMAL(7, 2))});
+  auto assertWithoutElse =
+      [&](const std::string& thenSql,
+          const core::TypedExprPtr& thenExpr,
+          const std::vector<std::optional<int64_t>>& values) {
+        SCOPED_TRACE(thenSql);
+        auto expected =
+            makeRowVector({makeNullableFlatVector<int64_t>(values)});
+        auto casePlan =
+            PlanBuilder()
+                .values({data})
+                .project({fmt::format("CASE WHEN flag THEN {} END", thenSql)})
+                .planNode();
+        AssertQueryBuilder(casePlan).assertResults(expected);
+
+        // DuckDB's SQL parser rejects two-argument IF; construct the typed
+        // call.
+        auto ifExpr = std::make_shared<core::CallTypedExpr>(
+            BIGINT(),
+            std::vector<core::TypedExprPtr>{
+                std::make_shared<core::FieldAccessTypedExpr>(BOOLEAN(), "flag"),
+                thenExpr},
+            "if");
+        auto ifPlan = PlanBuilder()
+                          .values({data})
+                          .addNode([&](auto nodeId, auto source) {
+                            return std::make_shared<core::ProjectNode>(
+                                nodeId,
+                                std::vector<std::string>{"result"},
+                                std::vector<core::TypedExprPtr>{ifExpr},
+                                source);
+                          })
+                          .planNode();
+        AssertQueryBuilder(ifPlan).assertResults(expected);
+      };
+
+  assertWithoutElse(
+      "value",
+      std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "value"),
+      {10, std::nullopt, std::nullopt, std::nullopt});
+  assertWithoutElse(
+      "CAST(7 AS BIGINT)",
+      std::make_shared<core::ConstantTypedExpr>(BIGINT(), variant(int64_t{7})),
+      {7, std::nullopt, std::nullopt, 7});
+  assertWithoutElse(
+      "CAST(NULL AS BIGINT)",
+      std::make_shared<core::ConstantTypedExpr>(
+          BIGINT(), variant::null(TypeKind::BIGINT)),
+      {std::nullopt, std::nullopt, std::nullopt, std::nullopt});
+
+  auto typedPlan = PlanBuilder()
+                       .values({data})
+                       .project({
+                           "CASE WHEN flag THEN string_value END",
+                           "CASE WHEN flag THEN decimal_value END",
+                       })
+                       .planNode();
+  auto typedExpected = makeRowVector({
+      makeNullableFlatVector<std::string>(
+          {"one", std::nullopt, std::nullopt, std::nullopt}),
+      makeNullableFlatVector<int64_t>(
+          {123, std::nullopt, std::nullopt, std::nullopt}, DECIMAL(7, 2)),
+  });
+  AssertQueryBuilder(typedPlan).assertResults(typedExpected);
+
+  auto plan =
+      PlanBuilder()
+          .values({data})
+          .project({"CASE WHEN flag THEN value ELSE CAST(NULL AS BIGINT) END"})
+          .planNode();
+  auto expected = makeRowVector({makeNullableFlatVector<int64_t>(
+      {10, std::nullopt, std::nullopt, std::nullopt})});
+  AssertQueryBuilder(plan).assertResults(expected);
+}
+
+TEST_F(CudfFilterProjectTest, switchWithoutElseNestedTypes) {
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const auto previousFallback = config.allowCpuFallback;
+  SCOPE_EXIT {
+    config.allowCpuFallback = previousFallback;
+  };
+  config.allowCpuFallback = true;
+
+  auto data = makeRowVector(
+      {"flag", "values", "pair"},
+      {makeNullableFlatVector<bool>({true, false, std::nullopt}),
+       makeArrayVector<int64_t>({{1, 2}, {3}, {}}),
+       makeRowVector({makeFlatVector<int64_t>({10, 20, 30})})});
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .project({
+                      "CASE WHEN flag THEN values END AS a",
+                      "CASE WHEN flag THEN pair END AS r",
+                  })
+                  .planNode();
+
+  cudf_velox::unregisterCudf();
+  auto cpuResult = AssertQueryBuilder(plan).copyResults(pool());
+  cudf_velox::registerCudf();
+  auto fallbackResult = AssertQueryBuilder(plan).copyResults(pool());
+  facebook::velox::test::assertEqualVectors(cpuResult, fallbackResult);
 }
 
 TEST_F(CudfFilterProjectTest, greatestLeastAllColumns) {
